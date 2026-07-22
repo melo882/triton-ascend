@@ -1,143 +1,463 @@
-# This is not the build system, just a helper to run common development commands.
-# Make sure to first initialize the build system with:
-#     make dev-install
+class AtomicStoreOpLowering : public OpRewritePattern<hivm::StoreOp> {
+  using OpRewritePattern<hivm::StoreOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(hivm::StoreOp op,
+                                PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto elemType = getElementTypeOrSelf(op.getDstOperandType());
+    auto atomicKind = op.getAtomicKind();
+    if (op.isAtomic()) {
+      if (elemType.isInteger(64))
+        return decomposeEltwiseAtomic(op, rewriter, loc);
+      if (*atomicKind == hivm::AtomicKind::UMAX ||
+          *atomicKind == hivm::AtomicKind::UMIN) {
+        assert(elemType.getIntOrFloatBitWidth() == 8);
+        return decomposeEltwiseAtomic(op, rewriter, loc, /*isUnsigned=*/true);
+      }
+      if ((*atomicKind == hivm::AtomicKind::ADD ||
+           *atomicKind == hivm::AtomicKind::MAX ||
+           *atomicKind == hivm::AtomicKind::MIN) &&
+          isAtomicOpHaveReturnedValue(op)) {
+        return addSyncForReturnedValue(op, rewriter, loc);
+      }
+    }
+    if (!op.isSWAtomic()) {
+      return failure();
+    }
+    switch (atomicKind.value()) {
+    case hivm::AtomicKind::AND:
+    case hivm::AtomicKind::OR:
+    case hivm::AtomicKind::XOR:
+      return decomposeEltwiseAtomic(op, rewriter, loc);
+    default:
+      return failure();
+    }
+  }
 
-PYTHON ?= python
-BUILD_DIR := $(shell cd python; $(PYTHON) -c 'from build_helpers import get_cmake_dir; print(get_cmake_dir())')
-TRITON_OPT := $(BUILD_DIR)/bin/triton-opt
-PYTEST := $(PYTHON) -m pytest
-LLVM_BUILD_PATH ?= "$(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))/.llvm-project/build"
-NUM_PROCS ?= 8
+private:
+  /// Find the load operation used to save the returned value before atomic operation being calculated
+  /// e.g. hivm.hir.load ins(%reinterpret_cast) outs(%alloc)
+  /// hivm.hir.store ins(%cast) outs(%reinterpret_cast)
+  ///
+  /// The load operation whose outs operand is same as store's ins operand is required
+  Operation* findReturnedValueLoadOp(hivm::StoreOp storeOp, Value targetValue) const {
+    if (!targetValue) return nullptr;
 
-# Incremental builds
+    Operation* op = storeOp->getPrevNode();
+    while (op) {
+      if (auto loadOp = dyn_cast<hivm::LoadOp>(op)) {
+        if (loadOp->getOperand(0) == targetValue) {
+          return loadOp;
+        }
+      }
+      op = op->getPrevNode();
+    }
 
-.PHONY: all
-all:
-	ninja -C $(BUILD_DIR)
+    return nullptr;
+  }
 
-.PHONY: triton-opt
-triton-opt:
-	ninja -C $(BUILD_DIR) triton-opt
+  bool isAtomicOpHaveReturnedValue(hivm::StoreOp storeOp) const {
+    Operation* returnedValueLoadOp = findReturnedValueLoadOp(storeOp, storeOp.getDst());
+    if (auto LoadOp = dyn_cast_or_null<hivm::LoadOp>(returnedValueLoadOp)) {
+      auto dst = LoadOp.getDst();
+      // If the dst of loadOp just be used for this loadop, the returned value dead code.
+      return llvm::range_size(dst.getUsers()) > 1;
+    }
+    return false;
+  }
 
-# Testing
+  LogicalResult addSyncForReturnedValue(hivm::StoreOp op,
+                                        PatternRewriter &rewriter, Location loc) const {
+    static constexpr llvm::StringLiteral kAlreadySync =
+        "already_sync";
+    if (op->hasAttr(kAlreadySync)) {
+      return failure();
+    }
+    Operation* returnedValueLoadOp = findReturnedValueLoadOp(op, op.getDst());
+    PatternRewriter::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(returnedValueLoadOp);
 
-.PHONY: test-lit
-test-lit:
-	ninja -C $(BUILD_DIR) check-triton-lit-tests
+    auto lockVar = createSyncBlockLockVar(rewriter, op->getLoc());
+    ::mlir::Value val = lockVar;
+    Operation *lockDefOp = val.getDefiningOp();
+    auto createLockOp = dyn_cast<hivm::CreateSyncBlockLockOp>(lockDefOp);
+    if (createLockOp) {
+        createLockOp->setAttr(hivm::SyncBlockLockUnorderedAttr::name, rewriter.getUnitAttr());
+    }
+    auto lockOp = rewriter.create<hivm::SyncBlockLockOp>(loc, lockVar);
+    lockOp->setAttr(hivm::SyncBlockLockUnorderedAttr::name, rewriter.getUnitAttr());
 
-.PHONY: test-cpp
-test-cpp:
-	ninja -C $(BUILD_DIR) check-triton-unit-tests
+    rewriter.setInsertionPointAfter(op);
+    auto unlockOp = rewriter.create<hivm::SyncBlockUnlockOp>(loc, lockVar);
+    unlockOp->setAttr(hivm::SyncBlockLockUnorderedAttr::name, rewriter.getUnitAttr());
 
-.PHONY: test-unit
-test-unit: all
-	cd python/test/unit && $(PYTEST) -s -n $(NUM_PROCS) --ignore=language/test_line_info.py \
-		--ignore=language/test_subprocess.py --ignore=test_debug.py
-	$(PYTEST) -s -n $(NUM_PROCS) python/test/unit/language/test_subprocess.py
-	$(PYTEST) -s -n $(NUM_PROCS) python/test/unit/test_debug.py --forked
-	$(PYTEST) -s -n 6 python/triton_kernels/tests/
-	TRITON_DISABLE_LINE_INFO=0 $(PYTEST) -s python/test/unit/language/test_line_info.py
-	# Run attention separately to avoid out of gpu memory
-	$(PYTEST) -vs python/tutorials/06-fused-attention.py
-	$(PYTEST) -vs python/tutorials/gluon/01-intro.py python/tutorials/gluon/02-layouts.py python/tutorials/gluon/03-async-copy.py python/tutorials/gluon/04-tma.py python/tutorials/gluon/05-wgmma.py python/tutorials/gluon/06-tcgen05.py python/tutorials/gluon/07-persistence.py python/tutorials/gluon/08-warp-specialization.py
-	$(PYTEST) -vs python/examples/gluon/01-attention-forward.py
-	TRITON_ALWAYS_COMPILE=1 TRITON_DISABLE_LINE_INFO=0 LLVM_PASS_PLUGIN_PATH=python/triton/instrumentation/libGPUInstrumentationTestLib.so \
-		$(PYTEST) --capture=tee-sys -rfs -vvv python/test/unit/instrumentation/test_gpuhello.py
-	$(PYTEST) -s -n $(NUM_PROCS) python/test/gluon
+    op->setAttr(kAlreadySync, UnitAttr::get(op->getContext()));
+    return success();
+  }
 
-.PHONY: test-distributed
-test-distributed: all
-	$(PYTHON) -m pip install --upgrade pip
-	$(PYTHON) -m pip install python/triton_kernels -v
-	$(PYTEST) -s python/triton_kernels/bench/distributed.py
+  /// implement atomic by software way
+  /// e.g.store ins(% res_ub) outs(% res_gm) with atomic XOR is converted to
+  /// % lock_var = create_sync_lock()
+  /// sync_block_lock(% lock_var)
+  ///
+  /// % tmp0_ub = load % res_gm % tmp0_ub =
+  /// % tmp0_ub xor % res_ub
+  /// store ins(% tmp0_ub) outs(% res_gm)
+  ///
+  /// sync_block_unlock(% lock_var)
+  LogicalResult decomposeEltwiseAtomic(hivm::StoreOp op,
+                                       PatternRewriter &rewriter, Location loc,
+                                       bool isUnsigned = false) const {
+    auto lockVar = createSyncBlockLockVar(rewriter, op->getLoc());
+    ::mlir::Value val = lockVar;
+    Operation *lockDefOp = val.getDefiningOp();
+    auto createLockOp = dyn_cast<hivm::CreateSyncBlockLockOp>(lockDefOp);
+    if (createLockOp) {
+        createLockOp->setAttr(hivm::SyncBlockLockUnorderedAttr::name, rewriter.getUnitAttr());
+    }
+    auto lockOp = rewriter.create<hivm::SyncBlockLockOp>(loc, lockVar);
+    lockOp->setAttr(hivm::SyncBlockLockUnorderedAttr::name, rewriter.getUnitAttr());
 
-.PHONY: test-gluon
-test-gluon: all
-	$(PYTEST) -s -n $(NUM_PROCS) python/test/gluon
-	$(PYTEST) -vs python/examples/gluon/01-attention-forward.py
+    // 2. create tmp memref alloc and load dst to tmp
+    auto src = op.getSrc();
+    auto tmpUB = createTmpBufferOrTensorWithTargetType(rewriter, loc, src);
 
-.PHONY: test-regression
-test-regression: all
-	$(PYTEST) -s -n $(NUM_PROCS) python/test/regression
+    auto dst = op.getDst();
+    rewriter.create<hivm::LoadOp>(loc, TypeRange{}, dst, tmpUB);
 
-.PHONY: test-microbenchmark
-test-microbenchmark: all
-	$(PYTHON) python/test/microbenchmark/launch_overhead.py
+    if (isUnsigned) {
+      hivm::RoundMode rounding = mlir::utils::selectRoundMode<hivm::RoundMode>(
+          getElementTypeOrSelf(dst), rewriter.getF16Type());
+      auto roundingAttr = rewriter.getAttr<hivm::RoundModeAttr>(rounding);
+      hivm::TypeFn typeFn = hivm::TypeFn::cast_unsigned;
+      auto typeFnAttr = rewriter.getAttr<hivm::TypeFnAttr>(typeFn);
+      src = castTo(rewriter, src.getLoc(), src, roundingAttr,
+                   rewriter.getF16Type(), typeFnAttr)
+                .getSingleDst();
+      tmpUB = castTo(rewriter, src.getLoc(), tmpUB, roundingAttr,
+                     rewriter.getF16Type(), typeFnAttr)
+                  .getSingleDst();
+    }
 
-.PHONY: test-interpret
-test-interpret: all
-	cd python/test/unit && TRITON_INTERPRET=1 $(PYTEST) -s -n 16 -m interpreter cuda language/test_core.py language/test_standard.py \
-		language/test_random.py language/test_block_pointer.py language/test_subprocess.py language/test_line_info.py \
-		language/test_tuple.py runtime/test_autotuner.py::test_kwargs[False] \
-		../../tutorials/06-fused-attention.py::test_op --device=cpu
+    // 3. do eltwise vv between src and tmp(and/or/xor)
+    auto resUB = createTmpBufferOrTensorWithTargetType(rewriter, loc, src);
+    auto eltwiseOp = createEltwiseOpByAtomicKind(
+        rewriter, loc, TypeRange{}, ValueRange{src, tmpUB}, ValueRange{resUB},
+        op.getAtomicKind().value());
+    if (!eltwiseOp.has_value()) {
+      return op.emitError("not support block-sync atomic kind!!");
+    }
 
-.PHONY: test-proton
-test-proton: all
-	$(PYTEST) -s -n 8 third_party/proton/test --ignore=third_party/proton/test/test_override.py
-	$(PYTEST) -s third_party/proton/test/test_override.py
+    if (isUnsigned) {
+      hivm::RoundMode rounding = mlir::utils::selectRoundMode<hivm::RoundMode>(
+          rewriter.getF16Type(), getElementTypeOrSelf(dst));
+      auto roundingAttr = rewriter.getAttr<hivm::RoundModeAttr>(rounding);
+      hivm::TypeFn typeFn = hivm::TypeFn::cast_unsigned;
+      auto typeFnAttr = rewriter.getAttr<hivm::TypeFnAttr>(typeFn);
+      resUB = castTo(rewriter, src.getLoc(), resUB, roundingAttr,
+                     getElementTypeOrSelf(dst), typeFnAttr)
+                  .getSingleDst();
+    }
 
-.PHONY: test-python
-test-python: test-unit test-regression test-interpret test-proton
+    // 4. store tmp to dst
+    rewriter.create<hivm::StoreOp>(loc, TypeRange{}, resUB, dst);
 
-.PHONY: test-nogpu
-test-nogpu: test-lit test-cpp
+    auto unlockOp = rewriter.create<hivm::SyncBlockUnlockOp>(loc, lockVar);
+    unlockOp->setAttr(hivm::SyncBlockLockUnorderedAttr::name, rewriter.getUnitAttr());
 
-.PHONY: test
-test: test-lit test-cpp test-python
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
 
-# pip install-ing
+class AtomicRMWOpLowering : public OpRewritePattern<hivm::AtomicRMWOp> {
+  using OpRewritePattern<hivm::AtomicRMWOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(hivm::AtomicRMWOp op,
+                                PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    // If RMW don't have return args -> replace it to store
+    if (op.getNumResults() == 0) {
+      // convert hivm::AtomicRMWOp to hivm::StoreOp
+      Value src = op.getSrc();
+      Value dst = op.getDst();
 
-.PHONY: dev-install-requires
-dev-install-requires:
-	$(PYTHON) -m pip install -r python/requirements.txt
-	$(PYTHON) -m pip install -r python/test-requirements.txt
+      auto newStoreOp =
+          rewriter.create<hivm::StoreOp>(loc, TypeRange(), src, dst);
 
+      // Add atomic attr to hivm.store
+      auto hsAtomicKind = op.getAtomicKind();
+      newStoreOp.setAtomicKind(hsAtomicKind);
 
-.PHONY: dev-install-torch
-dev-install-torch:
-	# install torch but ensure pytorch-triton isn't installed
-	$(PYTHON) -m pip install torch
-	$(PYTHON) -m pip uninstall triton pytorch-triton -y
+      rewriter.replaceOp(op, newStoreOp);
+      return success();
+    }
+    // If RMW has return value we should always use software lock
 
-.PHONY: dev-install-triton
-dev-install-triton:
-	$(PYTHON) -m pip install -e . --no-build-isolation -v
+    return decomposeEltwiseAtomic(op, rewriter, loc);
+  }
 
-.PHONY: dev-install
-.NOPARALLEL: dev-install
-dev-install: dev-install-requires dev-install-triton
+  bool shouldCastOperation(hivm::AtomicRMWOp op) const {
+    switch (op.getAtomicKind()) {
+    case hivm::AtomicKind::ADD:
+    case hivm::AtomicKind::MIN:
+    case hivm::AtomicKind::MAX:
+      return true;
+    default:
+      return false;
+    }
+  }
 
-.PHONY: dev-install-llvm
-.NOPARALLEL: dev-install-llvm
-dev-install-llvm:
-	LLVM_BUILD_PATH=$(LLVM_BUILD_PATH) scripts/build-llvm-project.sh
-	TRITON_BUILD_WITH_CLANG_LLD=1 TRITON_BUILD_WITH_CCACHE=0 \
-		LLVM_INCLUDE_DIRS=$(LLVM_BUILD_PATH)/include \
-		LLVM_LIBRARY_DIR=$(LLVM_BUILD_PATH)/lib \
-		LLVM_SYSPATH=$(LLVM_BUILD_PATH) \
-	$(MAKE) dev-install
+  Value processCastTo(PatternRewriter &rewriter, Location loc, Value val,
+                      Type initType) const {
+    if (initType.isInteger(8)) {
+      auto roundingAttr =
+          rewriter.getAttr<hivm::RoundModeAttr>(hivm::RoundMode::RINT);
 
-# Updating lit tests
+      val = castTo(rewriter, loc, val, roundingAttr, rewriter.getF16Type())
+                .getSingleDst();
+      val = castTo(rewriter, loc, val, roundingAttr, rewriter.getF32Type())
+                .getSingleDst();
+    } else if (initType.isBF16()) {
+      auto roundingAttr =
+          rewriter.getAttr<hivm::RoundModeAttr>(hivm::RoundMode::RINT);
 
-.PHONY: golden-samples
-golden-samples: triton-opt
-	$(TRITON_OPT) test/TritonGPU/samples/simulated-grouped-gemm.mlir.in -tritongpu-pipeline -canonicalize | \
-		$(PYTHON) utils/generate-test-checks.py --source test/TritonGPU/samples/simulated-grouped-gemm.mlir.in --source_delim_regex="\bmodule" \
-		-o test/TritonGPU/samples/simulated-grouped-gemm.mlir
-	$(TRITON_OPT) test/TritonGPU/samples/descriptor-matmul-pipeline.mlir.in -tritongpu-assign-latencies -tritongpu-schedule-loops -tritongpu-pipeline -canonicalize | \
-		$(PYTHON) utils/generate-test-checks.py --source test/TritonGPU/samples/descriptor-matmul-pipeline.mlir.in --source_delim_regex="\bmodule" \
-		-o test/TritonGPU/samples/descriptor-matmul-pipeline.mlir
+      val = castTo(rewriter, loc, val, roundingAttr, rewriter.getF32Type())
+                .getSingleDst();
+    }
 
-# Documentation
-#
-.PHONY: docs-requirements
-docs-requirements:
-	$(PYTHON) -m pip install -r docs/requirements.txt -q
+    return val;
+  }
 
-.PHONY: docs-only
-docs-only:
-	cd docs; PATH="$(BUILD_DIR):$(PATH)" $(PYTHON) -m sphinx . _build/html/main
+  Value processCastFrom(PatternRewriter &rewriter, Location loc, Value val,
+                        Type initType) const {
+    if (initType.isInteger(8)) {
+      auto truncAttr =
+          rewriter.getAttr<hivm::RoundModeAttr>(hivm::RoundMode::TRUNC);
+      val = castTo(rewriter, loc, val, truncAttr, rewriter.getI32Type())
+                .getSingleDst();
 
-.PHONY: docs
-.NOPARALLEL: docs
-docs: docs-requirements docs-only
+      auto truncOverflowAttr = rewriter.getAttr<hivm::RoundModeAttr>(
+          hivm::RoundMode::TRUNCWITHOVERFLOW);
+      val = castTo(rewriter, loc, val, truncOverflowAttr, rewriter.getI8Type())
+                .getSingleDst();
+    } else if (initType.isBF16()) {
+      auto roundingAttr =
+          rewriter.getAttr<hivm::RoundModeAttr>(hivm::RoundMode::RINT);
+
+      val = castTo(rewriter, loc, val, roundingAttr, rewriter.getBF16Type())
+                .getSingleDst();
+    }
+
+    return val;
+  }
+
+  LogicalResult decomposeEltwiseAtomic(hivm::AtomicRMWOp op,
+                                       PatternRewriter &rewriter,
+                                       Location loc) const {
+    auto lockVar = createSyncBlockLockVar(rewriter, op->getLoc());
+    ::mlir::Value val = lockVar;
+    Operation *lockDefOp = val.getDefiningOp();
+    auto createLockOp = dyn_cast<hivm::CreateSyncBlockLockOp>(lockDefOp);
+    if (createLockOp) {
+        createLockOp->setAttr(hivm::SyncBlockLockUnorderedAttr::name, rewriter.getUnitAttr());
+    }
+    auto lockOp = rewriter.create<hivm::SyncBlockLockOp>(loc, lockVar);
+    lockOp->setAttr(hivm::SyncBlockLockUnorderedAttr::name, rewriter.getUnitAttr());
+
+    // 2. create tmp memref alloc and load dst to tmp
+    auto src = op.getSrc();
+    auto tmpUB = createTmpBufferOrTensorWithTargetType(rewriter, loc,
+                                                       op.getResults()[0]);
+    rewriter.replaceAllUsesWith(op.getResults()[0], tmpUB);
+
+    auto dst = op.getDst();
+    rewriter.create<hivm::LoadOp>(loc, TypeRange{}, dst, tmpUB);
+
+    auto elementType = getElementTypeOrSelf(src);
+    bool shouldCast = shouldCastOperation(op);
+    if (shouldCast) {
+      src = processCastTo(rewriter, op.getLoc(), src, elementType);
+      tmpUB = processCastTo(rewriter, op.getLoc(), tmpUB, elementType);
+    }
+
+    // 3. do eltwise vv between src and tmp(and/or/xor)
+    auto resUB = createTmpBufferOrTensorWithTargetType(rewriter, loc, src);
+    auto eltwiseOp = createEltwiseOpByAtomicKind(
+        rewriter, loc, TypeRange{}, ValueRange{src, tmpUB}, ValueRange{resUB},
+        op.getAtomicKind());
+    if (!eltwiseOp.has_value()) {
+      return op.emitError("not support block-sync atomic kind!!");
+    }
+
+    if (shouldCast) {
+      resUB = processCastFrom(rewriter, loc, resUB, elementType);
+    }
+
+    // 4. store tmp to dst
+    rewriter.create<hivm::StoreOp>(loc, TypeRange{}, resUB, dst);
+
+    auto unlockOp = rewriter.create<hivm::SyncBlockUnlockOp>(loc, lockVar);
+    unlockOp->setAttr(hivm::SyncBlockLockUnorderedAttr::name, rewriter.getUnitAttr());
+
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+/// implement atomic cas in software way
+/// e.g. hivm.hir.atomic_cas ins(%src0_ub, src1_ub) outs(%dst_gm) is converted
+/// to
+/// 1. %lock_var = create_sync_lock()
+/// 2. sync_block_lock(%lock_var)
+/// 3. %tmp0_ub = load(%dst_gm)
+/// 4. %cond = vcmp(tmp0_ub, src0_ub)
+/// 5. %tmp0_ub = vsel(%cond, src1_ub, tmp0_ub)
+/// 6. %dst_gm = store(%tmp0_ub)
+/// 7. sync_block_unlock(%lock_var)
+class AtomicCasOpLowering : public OpRewritePattern<hivm::AtomicCasOp> {
+  using OpRewritePattern<hivm::AtomicCasOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(hivm::AtomicCasOp op,
+                                PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto lockVar = createSyncBlockLockVar(rewriter, op->getLoc());
+    ::mlir::Value val = lockVar;
+    Operation *lockDefOp = val.getDefiningOp();
+    auto createLockOp = dyn_cast<hivm::CreateSyncBlockLockOp>(lockDefOp);
+    if (createLockOp) {
+        createLockOp->setAttr(hivm::SyncBlockLockUnorderedAttr::name, rewriter.getUnitAttr());
+    }
+    auto lockOp = rewriter.create<hivm::SyncBlockLockOp>(loc, lockVar);
+    lockOp->setAttr(hivm::SyncBlockLockUnorderedAttr::name, rewriter.getUnitAttr());
+
+    // step1: load old val in gm to ub
+    auto src0 = op.getSrc()[0];
+
+    bool hasReturn = !op.getResults().empty();
+    auto tmpUB = createTmpBufferOrTensorWithTargetType(
+        rewriter, loc, hasReturn ? op.getResults()[0] : src0);
+
+    auto dst = op.getDst();
+    rewriter.create<hivm::LoadOp>(loc, TypeRange{}, dst, tmpUB);
+
+    // step2: condition = vcmp(dst, expected_val)
+    auto condUB = createTmpBufferOrTensorWithTargetType(rewriter, loc, src0,
+                                                        rewriter.getI1Type());
+    auto compareAttr =
+        rewriter.getAttr<hivm::CompareModeAttr>(hivm::CompareMode::EQ);
+    auto elemType = getElementTypeOrSelf(src0);
+    auto src1 = op.getSrc()[1];
+    hivm::RoundMode rounding = hivm::RoundMode::RINT;
+    auto roundingAttr = rewriter.getAttr<hivm::RoundModeAttr>(rounding);
+    if (elemType.isInteger(8)) {
+      src0 = castTo(rewriter, src0.getLoc(), src0, roundingAttr,
+                    rewriter.getF16Type())
+                 .getSingleDst();
+      src1 = castTo(rewriter, src1.getLoc(), src1, roundingAttr,
+                    rewriter.getF16Type())
+                 .getSingleDst();
+      tmpUB = castTo(rewriter, tmpUB.getLoc(), tmpUB, roundingAttr,
+                     rewriter.getF16Type())
+                  .getSingleDst();
+    } else if (elemType.isBF16()) {
+      src0 = castTo(rewriter, src0.getLoc(), src0, roundingAttr,
+                    rewriter.getF32Type())
+                 .getSingleDst();
+      src1 = castTo(rewriter, src1.getLoc(), src1, roundingAttr,
+                    rewriter.getF32Type())
+                 .getSingleDst();
+      tmpUB = castTo(rewriter, tmpUB.getLoc(), tmpUB, roundingAttr,
+                     rewriter.getF32Type())
+                  .getSingleDst();
+    }
+    rewriter.create<hivm::VCmpOp>(op.getLoc(), TypeRange(),
+                                  ValueRange({tmpUB, src0}), Value(condUB),
+                                  compareAttr);
+
+    auto resUB = createTmpBufferOrTensorWithTargetType(rewriter, loc, src0);
+    rewriter.create<hivm::VSelOp>(op.getLoc(), TypeRange(),
+                                  ValueRange({condUB, src1, tmpUB}),
+                                  ValueRange({resUB}), Value());
+    if (elemType.isInteger(8)) {
+      resUB = castTo(rewriter, resUB.getLoc(), resUB, roundingAttr,
+                     rewriter.getI8Type())
+                  .getSingleDst();
+    } else if (elemType.isBF16()) {
+      resUB = castTo(rewriter, resUB.getLoc(), resUB, roundingAttr,
+                     rewriter.getBF16Type())
+                  .getSingleDst();
+    }
+
+    // step3: store res_ub to dst
+    rewriter.create<hivm::StoreOp>(loc, TypeRange{}, resUB, dst);
+
+    auto unlockOp = rewriter.create<hivm::SyncBlockUnlockOp>(loc, lockVar);
+    unlockOp->setAttr(hivm::SyncBlockLockUnorderedAttr::name, rewriter.getUnitAttr());
+
+    if (hasReturn) {
+      rewriter.replaceAllUsesWith(op.getResults()[0], tmpUB);
+    }
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+/// implement atomic xchg in software way
+/// e.g. hivm.hir.atomic_xchg ins(%src_ub) outs(%dst_gm) is converted to
+/// 1. %lock_var = create_sync_lock()
+/// 2. sync_block_lock(%lock_var)
+/// 3. %tmp0_ub = load(%dst_gm)
+/// 4. %dst_gm = store(%src_ub)
+/// 5. %src_ub = copy(%tmp0_ub)
+/// 7. sync_block_unlock(%lock_var)
+class AtomicXchgOpLowering : public OpRewritePattern<hivm::AtomicXchgOp> {
+  using OpRewritePattern<hivm::AtomicXchgOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(hivm::AtomicXchgOp op,
+                                PatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto lockVar = createSyncBlockLockVar(rewriter, op->getLoc());
+    ::mlir::Value val = lockVar;
+    Operation *lockDefOp = val.getDefiningOp();
+    auto createLockOp = dyn_cast<hivm::CreateSyncBlockLockOp>(lockDefOp);
+    if (createLockOp) {
+        createLockOp->setAttr(hivm::SyncBlockLockUnorderedAttr::name, rewriter.getUnitAttr());
+    }
+    auto lockOp = rewriter.create<hivm::SyncBlockLockOp>(loc, lockVar);
+    lockOp->setAttr(hivm::SyncBlockLockUnorderedAttr::name, rewriter.getUnitAttr());
+
+    auto src = op.getSrc();
+    auto dst = op.getDst();
+    auto mask = op.getMask();
+
+    // step1: load old val in dst gm to ub
+    bool hasReturn = !op.getResults().empty();
+    auto tmpUB_dst = createTmpBufferOrTensorWithTargetType(
+        rewriter, loc, hasReturn ? op.getResults()[0] : src);
+    rewriter.create<hivm::LoadOp>(loc, TypeRange{}, dst, tmpUB_dst);
+    if (mask) {
+      // step2: select according to the mask
+      auto tmpUB_masked_dst =
+          createTmpBufferOrTensorWithTargetType(rewriter, loc, src);
+      rewriter.create<hivm::VSelOp>(loc, TypeRange{},
+                                    ValueRange({mask, src, tmpUB_dst}),
+                                    ValueRange({tmpUB_masked_dst}), Value());
+      rewriter.create<hivm::VSelOp>(loc, TypeRange{},
+                                    ValueRange({mask, tmpUB_dst, src}),
+                                    ValueRange({src}), Value());
+      // step3: copy/store the selected value
+      rewriter.create<hivm::StoreOp>(loc, TypeRange{}, tmpUB_masked_dst, dst);
+    } else {
+      // step2: store new val to dst gm
+      rewriter.create<hivm::StoreOp>(loc, TypeRange{}, src, dst);
+      // step3: copy old val to src ub
+      rewriter.create<hivm::CopyOp>(loc, TypeRange{}, tmpUB_dst, src);
+    }
+
+    auto unlockOp = rewriter.create<hivm::SyncBlockUnlockOp>(loc, lockVar);
+    unlockOp->setAttr(hivm::SyncBlockLockUnorderedAttr::name, rewriter.getUnitAttr());
+
+    if (hasReturn) {
+      rewriter.replaceAllUsesWith(op.getResults()[0], tmpUB_dst);
+    }
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
