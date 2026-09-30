@@ -1,224 +1,1084 @@
-# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-# THE SOFTWARE.
+# -*- coding: utf-8 -*-
+# Copyright (c) Huawei Technologies Co., Ltd. 2025-2025. All rights reserved.
 
-import contextlib
-import itertools
-import re
 import math
-import textwrap
-import os
-import inspect
-import pathlib
-
-import numpy as np
-import pytest
-import torch
-import torch_npu
+import random
 import triton
 import triton.language as tl
+import triton.language.extra.cann.extension as extension
+import torch
+import torch_npu
+import pytest
+import test_common
+from test_common import TestUtils, check_ub_mem_overflow, get_dtype_size
 
-from numpy.random import RandomState
-from triton.language.extra import libdevice
+dtype_max_size_1d = {
+    'int8 -> bfloat16': 32768,
+    'uint8 -> bfloat16': 32768,
+    'int8 -> float16': 65536,
+    'uint8 -> float16': 65536,
+    'int8 -> bool': 49056,
+    'uint8 -> bool': 49056,
+    'int8 -> float32': 32768,
+    'uint8 -> float32': 32768,
+    'int8 -> int32': 32768,
+    'int8 -> uint32': 32768,
+    'uint8 -> int32': 32768,
+    'uint8 -> uint32': 32768,
+    'uint8 -> int16': 32768,
+    'uint8 -> uint16': 32768,
+    'int8 -> int16': 32768,
+    'int8 -> uint16': 84650,
+    'int8 -> uint8': 196608,
+    'int8 -> int8': 196608,
+    'uint8 -> uint8': 196608,
+    'uint8 -> int8': 196608,
+    'int8 -> int64': 16384,
+    'int8 -> uint64': 28206,
+    'uint8 -> int64': 16384,
+    'uint8 -> uint64': 16384,
+    'bool -> int8': 49056,
+    'int16 -> int8': 24576,
+    'int16 -> uint8': 24576,
+    'int16 -> float16': 98304,
+    'int16 -> bfloat16': 32768,
+    'int16 -> float32': 32768,
+    'int16 -> int64': 16384,
+    'int16 -> int16': 98304,
+    'int16 -> int32': 32768,
+    'int32 -> int8': 14016,
+    'int32 -> uint8': 14016,
+    'int32 -> int16': 32736,
+    'int32 -> float16': 32768,
+    'int32 -> bfloat16': 32768,
+    'int32 -> float32': 49152,
+    'int32 -> int64': 16384,
+    'int32 -> int32': 49152,
+    'float16 -> int8': 12288,
+    'bfloat16 -> int8': 12288,
+    'float16 -> uint8': 12288,
+    'bfloat16 -> uint8': 12288,
+    'float16 -> bfloat16': 98304,
+    'float16 -> float16': 98304,
+    'bfloat16 -> bfloat16': 98304,
+    'bfloat16 -> float16': 98304,
+    'float16 -> float32': 32768,
+    'bfloat16 -> float32': 32768,
+    'float16 -> int16': 32736,
+    'bfloat16 -> int16': 32736,
+    'float16 -> int32': 32768,
+    'bfloat16 -> int32': 32768,
+    'float16 -> int64': 16384,
+    'bfloat16 -> int64': 16384,
+    'float32 -> int8': 12288,
+    'float32 -> uint8': 12288,
+    'float32 -> int16': 32736,
+    'float32 -> float16': 32768,
+    'float32 -> bfloat16': 32768,
+    'float32 -> int32': 49152,
+    'float32 -> int64': 16384,
+    'float32 -> float32': 49152,
+    'int64 -> int8': 8928,
+    'int64 -> uint8': 8928,
+    'int64 -> int16': 14016,
+    'int64 -> float16': 24576,
+    'int64 -> bfloat16': 24576,
+    'int64 -> int32': 24576,
+    'int64 -> int64': 24576,
+    'int64 -> bool': 28206,
+    #uint64
+    'uint64 -> int8': 8928,
+    'uint64 -> int16': 14016,
+    'uint64 -> int32': 24576,
+    'uint64 -> int64': 24576,
+    'uint64 -> float16': 24576,
+    'uint64 -> bfloat16': 24576,
+    'uint64 -> uint8': 8928,
+    'uint64 -> uint16': 14016,
+    'uint64 -> uint32': 24576,
+    'uint64 -> uint64': 24576,
+    'uint64 -> bool': 28206,
+    # uint16
+    'uint16 -> int8': 24576,
+    'uint16 -> uint8': 24576,
+    'uint16 -> float16': 98304,
+    'uint16 -> bfloat16': 32768,
+    'uint16 -> float32': 32768,
+    'uint16 -> int64': 16384,
+    'uint16 -> int16': 98304,
+    'uint16 -> uint16': 98304,
+    'uint16 -> uint32': 32768,
+    'uint16 -> uint64': 16384,
+    'uint16 -> bool': 49056,
+    #uint32
+    'uint32 -> int8': 14016,
+    'uint32 -> uint8': 14016,
+    'uint32 -> int16': 32736,
+    'uint32 -> float16': 32768,
+    'uint32 -> bfloat16': 32768,
+    'uint32 -> float32': 49152,
+    'uint32 -> int64': 16384,
+    'uint32 -> int32': 49152,
+    'uint32 -> uint32': 49152,
+    'uint32 -> uint16': 32736,
+    'uint32 -> uint64': 16384,
+    'uint32 -> bool': 24480,
+}
 
 
-@pytest.mark.parametrize("M, N, K, rhs_scale, normal_type, acc_num, num_warps",
-                         [(M, N, K, rhs_scale, normal_type, acc_num, 4)
-                          for M, N, K in itertools.product([32, 64], [32, 64], [32])
-                          for rhs_scale in [False, True]
-                          for normal_type in ["bf16", "fp16"]
-                          for acc_num in [None, 1, 2]])
-def test_scaled_dot(M, N, K, rhs_scale, normal_type, num_warps, acc_num):
-    device = "npu"
+@triton.jit
+def cast_to_bool(output_ptr, x_ptr, x_stride, y_stride, z_stride,
+                 DIM: tl.constexpr, XB: tl.constexpr, YB: tl.constexpr, ZB: tl.constexpr):
+    if DIM == 1:
+        xidx = tl.arange(0, XB)
+        idx = xidx * x_stride
+    elif DIM == 2:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        idx = xidx[:, None] * x_stride + yidx[None, :] * y_stride
+    elif DIM == 3:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        zidx = tl.arange(0, ZB)
+        idx = xidx[:, None, None] * x_stride + yidx[None, :, None] * y_stride + zidx[None, None, :] * z_stride
 
-    @triton.jit
-    def dot_scale_kernel(a_base, stride_a0, stride_a1, a_scale, b_base, stride_b0, stride_b1, b_scale, out,
-                         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, type_a: tl.constexpr,
-                         type_b: tl.constexpr, acc_num: tl.constexpr):
+    X = tl.load(x_ptr + idx)
+    ret = tl.cast(X, dtype=tl.int1)
+    tl.store(output_ptr + idx, ret)
 
-        PACKED_BLOCK_K_A: tl.constexpr = BLOCK_K
-        PACKED_BLOCK_K_B: tl.constexpr = BLOCK_K
-        a_ptr = a_base + tl.arange(0, BLOCK_M)[:, None] * stride_a0 + tl.arange(0,
-                                                                                PACKED_BLOCK_K_A)[None, :] * stride_a1
-        b_ptr = b_base + tl.arange(0, PACKED_BLOCK_K_B)[:, None] * stride_b0 + tl.arange(0,
-                                                                                         BLOCK_N)[None, :] * stride_b1
 
-        a = tl.load(a_ptr)
-        b = tl.load(b_ptr)
-        SCALE_BLOCK_K: tl.constexpr = BLOCK_K // 32
-        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        if a_scale is not None:
-            scale_a_ptr = a_scale + tl.arange(0, BLOCK_M)[:, None] * SCALE_BLOCK_K + tl.arange(0,
-                                                                                               SCALE_BLOCK_K)[None, :]
-            a_scale = tl.load(scale_a_ptr)
-        if b_scale is not None:
-            scale_b_ptr = b_scale + tl.arange(0, BLOCK_N)[:, None] * SCALE_BLOCK_K + tl.arange(0,
-                                                                                               SCALE_BLOCK_K)[None, :]
-            b_scale = tl.load(scale_b_ptr)
-        accumulator = tl.dot_scaled(a, a_scale, type_a, b, b_scale, type_b, acc=accumulator, fast_math=True,
-                                    out_dtype=tl.float32)
-        if acc_num is not None:
-            for _ in range(acc_num):
-                accumulator = tl.dot_scaled(a, a_scale, type_a, b, b_scale, type_b, acc=accumulator, fast_math=True,
-                                            out_dtype=tl.float32)
+@triton.jit
+def cast_to_uint8(output_ptr, x_ptr, x_stride, y_stride, z_stride,
+                  DIM: tl.constexpr, XB: tl.constexpr, YB: tl.constexpr, ZB: tl.constexpr):
+    if DIM == 1:
+        xidx = tl.arange(0, XB)
+        idx = xidx * x_stride
+    elif DIM == 2:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        idx = xidx[:, None] * x_stride + yidx[None, :] * y_stride
+    elif DIM == 3:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        zidx = tl.arange(0, ZB)
+        idx = xidx[:, None, None] * x_stride + yidx[None, :, None] * y_stride + zidx[None, None, :] * z_stride
 
-        out_ptr = out + tl.arange(0, BLOCK_M)[:, None] * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
-        tl.store(out_ptr, accumulator.to(a.dtype))
+    X = tl.load(x_ptr + idx)
+    ret = tl.cast(X, dtype=tl.uint8)
+    tl.store(output_ptr + idx, ret)
 
-    # The max exponent we use to initialize data in the x/y and associated scale tensor to avoid
-    # overflow when scaling.
-    comp_dtype_max_exp = 6 if normal_type == "fp16" else 15
 
-    torch.manual_seed(0)
+@triton.jit
+def cast_to_uint16(output_ptr, x_ptr, x_stride, y_stride, z_stride,
+                   DIM: tl.constexpr, XB: tl.constexpr, YB: tl.constexpr, ZB: tl.constexpr):
+    if DIM == 1:
+        xidx = tl.arange(0, XB)
+        idx = xidx * x_stride
+    elif DIM == 2:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        idx = xidx[:, None] * x_stride + yidx[None, :] * y_stride
+    elif DIM == 3:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        zidx = tl.arange(0, ZB)
+        idx = xidx[:, None, None] * x_stride + yidx[None, :, None] * y_stride + zidx[None, None, :] * z_stride
 
-    def make_arg(shape, ty):
-        if ty == "bf16" or ty == "fp16":
-            comp_dtype = torch.float16 if ty == "fp16" else torch.bfloat16
-            ret = torch.randn(shape, dtype=comp_dtype, device=device)
-            # Clamp to avoid relative error issues
-            ret.clamp_(-2**comp_dtype_max_exp, 2**comp_dtype_max_exp - 1)
-        else:
-            ret = torch.randint(256, shape, dtype=torch.uint8, device=device)
-        return ret
+    X = tl.load(x_ptr + idx)
+    ret = tl.cast(X, dtype=tl.uint16)
+    tl.store(output_ptr + idx, ret)
 
-    type_a = normal_type
-    type_b = type_a
 
-    x = make_arg((M, K), type_a)
-    y = make_arg((K, N), type_b)
+@triton.jit
+def cast_to_uint32(output_ptr, x_ptr, x_stride, y_stride, z_stride,
+                   DIM: tl.constexpr, XB: tl.constexpr, YB: tl.constexpr, ZB: tl.constexpr):
+    if DIM == 1:
+        xidx = tl.arange(0, XB)
+        idx = xidx * x_stride
+    elif DIM == 2:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        idx = xidx[:, None] * x_stride + yidx[None, :] * y_stride
+    elif DIM == 3:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        zidx = tl.arange(0, ZB)
+        idx = xidx[:, None, None] * x_stride + yidx[None, :, None] * y_stride + zidx[None, None, :] * z_stride
 
-    min_scale, max_scale = (0, 142) if type_a == torch.bfloat16 else (124, 131)
-    scale_x = torch.randint(min_scale, max_scale, (M, K // 32), dtype=torch.uint8, device=device)
-    min_scale, max_scale = (0, 142) if type_b == torch.bfloat16 else (124, 131)
-    scale_y = torch.randint(min_scale, max_scale, (N, K // 32), dtype=torch.uint8, device=device)
+    X = tl.load(x_ptr + idx)
+    ret = tl.cast(X, dtype=tl.uint32)
+    tl.store(output_ptr + idx, ret)
 
-    if not rhs_scale:
-        scale_y = None
 
-    def golden_ref(x, scale_x, y, scale_y):
-        shape_expand_x = x.shape[-1] // scale_x.shape[-1]
-        if x.dtype == torch.bfloat16:
-            upscale_x = scale_x.repeat_interleave(shape_expand_x, dim=1).to(torch.int16)
-            upscale_x = (upscale_x << 7).view(torch.bfloat16)
-        else:
-            scale_fp32 = scale_x.repeat_interleave(shape_expand_x, dim=1).to(torch.int32)
-            scale_fp32 = (scale_fp32 << 23).view(torch.float32)
-            upscale_x = scale_fp32.to(torch.float16)
-        upscale_y = None
-        if scale_y is None:
-            upscale_y = torch.ones_like(y)
-        else:
-            scale_y = scale_y.T
-            shape_expand_y = y.shape[0] // scale_y.shape[0]
-            if y.dtype == torch.bfloat16:
-                upscale_y = scale_y.repeat_interleave(shape_expand_y, dim=0).to(torch.int16)
-                upscale_y = (upscale_y << 7).view(torch.bfloat16)
+@triton.jit
+def cast_to_uint64(output_ptr, x_ptr, x_stride, y_stride, z_stride,
+                   DIM: tl.constexpr, XB: tl.constexpr, YB: tl.constexpr, ZB: tl.constexpr):
+    if DIM == 1:
+        xidx = tl.arange(0, XB)
+        idx = xidx * x_stride
+    elif DIM == 2:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        idx = xidx[:, None] * x_stride + yidx[None, :] * y_stride
+    elif DIM == 3:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        zidx = tl.arange(0, ZB)
+        idx = xidx[:, None, None] * x_stride + yidx[None, :, None] * y_stride + zidx[None, None, :] * z_stride
+
+    X = tl.load(x_ptr + idx)
+    ret = tl.cast(X, dtype=tl.uint64)
+    tl.store(output_ptr + idx, ret)
+
+
+@triton.jit
+def cast_to_i8(output_ptr, x_ptr, x_stride, y_stride, z_stride,
+               DIM: tl.constexpr, XB: tl.constexpr, YB: tl.constexpr, ZB: tl.constexpr):
+    if DIM == 1:
+        xidx = tl.arange(0, XB)
+        idx = xidx * x_stride
+    elif DIM == 2:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        idx = xidx[:, None] * x_stride + yidx[None, :] * y_stride
+    elif DIM == 3:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        zidx = tl.arange(0, ZB)
+        idx = xidx[:, None, None] * x_stride + yidx[None, :, None] * y_stride + zidx[None, None, :] * z_stride
+
+    X = tl.load(x_ptr + idx)
+    ret = tl.cast(X, dtype=tl.int8)
+    tl.store(output_ptr + idx, ret)
+
+
+@triton.jit
+def cast_to_i16(output_ptr, x_ptr, x_stride, y_stride, z_stride,
+                DIM: tl.constexpr, XB: tl.constexpr, YB: tl.constexpr, ZB: tl.constexpr):
+    if DIM == 1:
+        xidx = tl.arange(0, XB)
+        idx = xidx * x_stride
+    elif DIM == 2:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        idx = xidx[:, None] * x_stride + yidx[None, :] * y_stride
+    elif DIM == 3:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        zidx = tl.arange(0, ZB)
+        idx = xidx[:, None, None] * x_stride + yidx[None, :, None] * y_stride + zidx[None, None, :] * z_stride
+
+    X = tl.load(x_ptr + idx)
+    ret = tl.cast(X, dtype=tl.int16)
+    tl.store(output_ptr + idx, ret)
+
+
+@triton.jit
+def cast_to_i32(output_ptr, x_ptr, x_stride, y_stride, z_stride,
+                DIM: tl.constexpr, XB: tl.constexpr, YB: tl.constexpr, ZB: tl.constexpr):
+    if DIM == 1:
+        xidx = tl.arange(0, XB)
+        idx = xidx * x_stride
+    elif DIM == 2:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        idx = xidx[:, None] * x_stride + yidx[None, :] * y_stride
+    elif DIM == 3:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        zidx = tl.arange(0, ZB)
+        idx = xidx[:, None, None] * x_stride + yidx[None, :, None] * y_stride + zidx[None, None, :] * z_stride
+
+    X = tl.load(x_ptr + idx)
+    ret = tl.cast(X, dtype=tl.int32)
+    tl.store(output_ptr + idx, ret)
+
+
+@triton.jit
+def cast_to_i64(output_ptr, x_ptr, x_stride, y_stride, z_stride,
+                DIM: tl.constexpr, XB: tl.constexpr, YB: tl.constexpr, ZB: tl.constexpr):
+    if DIM == 1:
+        xidx = tl.arange(0, XB)
+        idx = xidx * x_stride
+    elif DIM == 2:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        idx = xidx[:, None] * x_stride + yidx[None, :] * y_stride
+    elif DIM == 3:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        zidx = tl.arange(0, ZB)
+        idx = xidx[:, None, None] * x_stride + yidx[None, :, None] * y_stride + zidx[None, None, :] * z_stride
+
+    X = tl.load(x_ptr + idx)
+    ret = tl.cast(X, dtype=tl.int64)
+    tl.store(output_ptr + idx, ret)
+
+
+@triton.jit
+def cast_to_fp32(output_ptr, x_ptr, x_stride, y_stride, z_stride,
+                 DIM: tl.constexpr, XB: tl.constexpr, YB: tl.constexpr, ZB: tl.constexpr):
+    if DIM == 1:
+        xidx = tl.arange(0, XB)
+        idx = xidx * x_stride
+    elif DIM == 2:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        idx = xidx[:, None] * x_stride + yidx[None, :] * y_stride
+    elif DIM == 3:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        zidx = tl.arange(0, ZB)
+        idx = xidx[:, None, None] * x_stride + yidx[None, :, None] * y_stride + zidx[None, None, :] * z_stride
+
+    X = tl.load(x_ptr + idx)
+    ret = tl.cast(X, dtype=tl.float32)
+    tl.store(output_ptr + idx, ret)
+
+
+@triton.jit
+def cast_to_fp16(output_ptr, x_ptr, x_stride, y_stride, z_stride,
+                 DIM: tl.constexpr, XB: tl.constexpr, YB: tl.constexpr, ZB: tl.constexpr):
+    if DIM == 1:
+        xidx = tl.arange(0, XB)
+        idx = xidx * x_stride
+    elif DIM == 2:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        idx = xidx[:, None] * x_stride + yidx[None, :] * y_stride
+    elif DIM == 3:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        zidx = tl.arange(0, ZB)
+        idx = xidx[:, None, None] * x_stride + yidx[None, :, None] * y_stride + zidx[None, None, :] * z_stride
+
+    X = tl.load(x_ptr + idx)
+    ret = tl.cast(X, dtype=tl.float16)
+    tl.store(output_ptr + idx, ret)
+
+
+@triton.jit
+def cast_to_bf16(output_ptr, x_ptr, x_stride, y_stride, z_stride,
+                 DIM: tl.constexpr, XB: tl.constexpr, YB: tl.constexpr, ZB: tl.constexpr):
+    if DIM == 1:
+        xidx = tl.arange(0, XB)
+        idx = xidx * x_stride
+    elif DIM == 2:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        idx = xidx[:, None] * x_stride + yidx[None, :] * y_stride
+    elif DIM == 3:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        zidx = tl.arange(0, ZB)
+        idx = xidx[:, None, None] * x_stride + yidx[None, :, None] * y_stride + zidx[None, None, :] * z_stride
+
+    X = tl.load(x_ptr + idx)
+    ret = tl.cast(X, dtype=tl.bfloat16)
+    tl.store(output_ptr + idx, ret)
+
+
+@triton.jit
+def cast_to_uint32(output_ptr, x_ptr, x_stride, y_stride, z_stride,
+                   DIM: tl.constexpr, XB: tl.constexpr, YB: tl.constexpr, ZB: tl.constexpr):
+    if DIM == 1:
+        xidx = tl.arange(0, XB)
+        idx = xidx * x_stride
+    elif DIM == 2:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        idx = xidx[:, None] * x_stride + yidx[None, :] * y_stride
+    elif DIM == 3:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        zidx = tl.arange(0, ZB)
+        idx = xidx[:, None, None] * x_stride + yidx[None, :, None] * y_stride + zidx[None, None, :] * z_stride
+
+    X = tl.load(x_ptr + idx)
+    ret = tl.cast(X, dtype=tl.uint32)
+    tl.store(output_ptr + idx, ret)
+
+
+@triton.jit
+def cast_to_int64(output_ptr, x_ptr, x_stride, y_stride, z_stride,
+                  DIM: tl.constexpr, XB: tl.constexpr, YB: tl.constexpr, ZB: tl.constexpr):
+    if DIM == 1:
+        xidx = tl.arange(0, XB)
+        idx = xidx * x_stride
+    elif DIM == 2:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        idx = xidx[:, None] * x_stride + yidx[None, :] * y_stride
+    elif DIM == 3:
+        xidx = tl.arange(0, XB)
+        yidx = tl.arange(0, YB)
+        zidx = tl.arange(0, ZB)
+        idx = xidx[:, None, None] * x_stride + yidx[None, :, None] * y_stride + zidx[None, None, :] * z_stride
+
+    X = tl.load(x_ptr + idx)
+    ret = tl.cast(X, dtype=tl.int64)
+    tl.store(output_ptr + idx, ret)
+
+
+triton_func_map = {
+    "bool": cast_to_bool,
+    "int8": cast_to_i8,
+    "int16": cast_to_i16,
+    "int32": cast_to_i32,
+    "float16": cast_to_fp16,
+    "bfloat16": cast_to_bf16,
+    "float32": cast_to_fp32,
+    "uint32": cast_to_uint32,
+    "int64": cast_to_int64,
+    "uint8": cast_to_uint8,
+    "uint16": cast_to_uint16,
+    "uint64": cast_to_uint64
+}
+
+
+def structParam(x0):
+    dim = x0.dim()
+    stride0, stride1, stride2 = 0, 0, 0
+    shape0, shape1, shape2 = 0, 0, 0
+    if dim >= 1:
+        stride0 = x0.stride(0)
+        shape0 = x0.shape[0]
+    if dim >= 2:
+        stride1 = x0.stride(1)
+        shape1 = x0.shape[1]
+    if dim == 3:
+        stride2 = x0.stride(2)
+        shape2 = x0.shape[2]
+    return dim, stride0, stride1, stride2, shape0, shape1, shape2
+
+
+@pytest.mark.parametrize('shape', TestUtils.full_shape)
+@pytest.mark.parametrize('srcDtype',
+                         ['int8', 'int16', 'int32', 'int64', 'bool', 'uint16', 'uint32', 'uint64']
+                         )
+@pytest.mark.parametrize('dstDtype',
+                         ['int8', 'int16', 'int32', 'int64', 'float16', 'float32', 'bfloat16', 'bool',
+                          'uint16', 'uint32', 'uint64']
+                         )
+def test_cast_int(srcDtype, dstDtype, shape):
+    srcBytes = get_dtype_size(srcDtype)
+    dstBytes = get_dtype_size(dstDtype)
+    dtype_size = max(srcBytes, dstBytes)
+    if 'int8' in {srcDtype, dstDtype} or 'uint8' in {srcDtype, dstDtype}:
+        key = f"{srcDtype} -> {dstDtype}"
+        max_size = dtype_max_size_1d[key]
+        numel = math.prod(shape)
+        if len(shape) == 1:  # 1-D
+            if numel > max_size:
+                pytest.skip(f"1-D shape {shape} numel={numel} > max_size={max_size}")
+        else:  # N-D
+            if (shape[-1] * dtype_size) % 32 == 0:  # 尾轴 32 B 对齐
+                limit = max_size // 8
             else:
-                scale_fp32 = scale_y.repeat_interleave(shape_expand_y, dim=0).to(torch.int32)
-                scale_fp32 = (scale_fp32 << 23).view(torch.float32)
-                upscale_y = scale_fp32.to(torch.float16)
-        ret = torch.matmul(x * upscale_x, y * upscale_y)
-        return ret
+                limit = max_size // 8 // 32
+            if numel > limit:
+                pytest.skip(f"ND shape {shape} numel={numel} > limit={limit}")
+    else:
+        if dtype_size * math.prod(shape) >= TestUtils.ub_size / 12:
+            pytest.skip(f"UB memory estimate overflow")
 
-    kernel_kwargs = {"num_warps": num_warps}
-    z = x.new_empty((M, N), dtype=x.dtype)
-    pgm = dot_scale_kernel[(1, )](x, *x.stride(), scale_x, y, *y.stride(), scale_y, z, M, N, K, type_a, type_b, acc_num,
-                                  **kernel_kwargs)
-    z_ref = golden_ref(x, scale_x, y, scale_y)
-    if acc_num is not None:
-        z_ref = z_ref * (acc_num + 1)
+    x0 = test_common.generate_tensor(shape, srcDtype)
+    torch_res = x0.to(eval("torch." + dstDtype))
+    x0 = x0.npu()
+    triton_func = triton_func_map.get(dstDtype, None)
+    assert triton_func is not None, f"triton_func not Found, srcDtype:{srcDtype}, dstDtype:{dstDtype}"
+    triton_res = torch.empty(shape, dtype=eval("torch." + dstDtype)).npu()
+    dim, stride0, stride1, stride2, XB, YB, ZB = structParam(x0)
+    assert 0 <= dim <= 3, f"dim out of range [0, 3], dim:{dim}"
+    triton_func[1, 1, 1](triton_res, x0, stride0, stride1, stride2, dim, XB, YB, ZB)
+    test_common.validate_cmp(dstDtype, triton_res, torch_res)
 
-    atol = 1e-5
-    rtol = 1e-2
-    torch.testing.assert_close(z, z_ref, atol=atol, rtol=rtol)
+
+@pytest.mark.parametrize('shape', TestUtils.full_shape)
+@pytest.mark.parametrize('srcDtype',
+                         ['float16', 'float32', 'bfloat16', 'int8', 'int16', 'int32', 'int64', 'uint8', 'bool',
+                          'uint16', 'uint32', 'uint64']
+                         )
+@pytest.mark.parametrize('dstDtype',
+                         ['float16', 'float32', 'bfloat16']
+                         )
+def test_cast_float(srcDtype, dstDtype, shape):
+    srcBytes = get_dtype_size(srcDtype)
+    dstBytes = get_dtype_size(dstDtype)
+    dtype_size = max(srcBytes, dstBytes)
+    if 'int8' in {srcDtype, dstDtype} or 'uint8' in {srcDtype, dstDtype}:
+        key = f"{srcDtype} -> {dstDtype}"
+        max_size = dtype_max_size_1d[key]
+        numel = math.prod(shape)
+        if len(shape) == 1:  # 1-D
+            if numel > max_size:
+                pytest.skip(f"1-D shape {shape} numel={numel} > max_size={max_size}")
+        else:  # N-D
+            if (shape[-1] * dtype_size) % 32 == 0:  # 尾轴 32 B 对齐
+                limit = max_size // 8
+            else:
+                limit = max_size // 8 // 32
+            if numel > limit:
+                pytest.skip(f"ND shape {shape} numel={numel} > limit={limit}")
+    else:
+        if dtype_size * math.prod(shape) >= TestUtils.ub_size / 12:
+            pytest.skip(f"UB memory estimate overflow")
+
+    x0 = test_common.generate_tensor(shape, srcDtype)
+    torch_res = x0.to(eval("torch." + dstDtype))
+    x0 = x0.npu()
+    triton_func = triton_func_map.get(dstDtype, None)
+    assert triton_func is not None, f"triton_func not Found, srcDtype:{srcDtype}, dstDtype:{dstDtype}"
+    triton_res = torch.empty(shape, dtype=eval("torch." + dstDtype)).npu()
+    dim, stride0, stride1, stride2, XB, YB, ZB = structParam(x0)
+    assert 0 <= dim <= 3, f"dim out of range [0, 3], dim:{dim}"
+    triton_func[1, 1, 1](triton_res, x0, stride0, stride1, stride2, dim, XB, YB, ZB)
+    test_common.validate_cmp(dstDtype, triton_res, torch_res)
 
 
-@pytest.mark.parametrize("normal_type", ["bf16", "fp16"])
-def test_scaled_dot_fast_math(normal_type):
-    device = "npu"
-    m = n = k = 32
+@triton.jit
+def cast_to_nd(
+        out_ptr, in_ptr,
+        D1: tl.constexpr, D2: tl.constexpr, D3: tl.constexpr, D4: tl.constexpr,
+        D5: tl.constexpr, D6: tl.constexpr, D7: tl.constexpr, D8: tl.constexpr,
+):
+    dtype = out_ptr.type.element_ty
 
-    @triton.jit
-    def dot_scale_kernel(a_base, stride_a0, stride_a1, a_scale, b_base, stride_b0, stride_b1, b_scale, out,
-                         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, type_a: tl.constexpr,
-                         type_b: tl.constexpr, fast_math: tl.constexpr):
+    off = tl.arange(0, D1) * (D2 * D3 * D4 * D5 * D6 * D7 * D8)
+    if (D2 * D3 * D4 * D5 * D6 * D7 * D8) > 1:
+        off = off[:, None, ] + tl.arange(0, D2)[None, :] * (D3 * D4 * D5 * D6 * D7 * D8)
+    if (D3 * D4 * D5 * D6 * D7 * D8) > 1:
+        off = off[:, :, None] + tl.arange(0, D3)[None, None, :] * (D4 * D5 * D6 * D7 * D8)
+    if (D4 * D5 * D6 * D7 * D8) > 1:
+        off = off[:, :, :, None] + tl.arange(0, D4)[None, None, None, :] * (D5 * D6 * D7 * D8)
+    if (D5 * D6 * D7 * D8) > 1:
+        off = off[:, :, :, :, None] + tl.arange(0, D5)[None, None, None, None, :] * (D6 * D7 * D8)
+    if (D6 * D7 * D8) > 1:
+        off = off[:, :, :, :, :, None] + tl.arange(0, D6)[None, None, None, None, None, :] * (D7 * D8)
+    if (D7 * D8) > 1:
+        off = off[:, :, :, :, :, :, None] + tl.arange(0, D7)[None, None, None, None, None, None, :] * D8
+    if D8 > 1:
+        off = off[:, :, :, :, :, :, :, None] + tl.arange(0, D8)[None, None, None, None, None, None, None, :]
 
-        a_ptr = a_base + tl.arange(0, BLOCK_M)[:, None] * stride_a0 + tl.arange(0, BLOCK_K)[None, :] * stride_a1
-        b_ptr = b_base + tl.arange(0, BLOCK_K)[:, None] * stride_b0 + tl.arange(0, BLOCK_N)[None, :] * stride_b1
-        a = tl.load(a_ptr)
-        b = tl.load(b_ptr)
+    mask = off < (D1 * D2 * D3 * D4 * D5 * D6 * D7 * D8)
+    x = tl.load(in_ptr + off)
+    y = tl.cast(x, dtype)
+    tl.store(out_ptr + off, y)
 
-        scale_block_k: tl.constexpr = BLOCK_K // 32
-        scale_a_ptr = a_scale + tl.arange(0, BLOCK_M)[:, None] * scale_block_k + tl.arange(0, scale_block_k)[None, :]
-        scale_b_ptr = b_scale + tl.arange(0, BLOCK_N)[:, None] * scale_block_k + tl.arange(0, scale_block_k)[None, :]
-        a_scale = tl.load(scale_a_ptr)
-        b_scale = tl.load(scale_b_ptr)
 
-        out_tensor = tl.dot_scaled(a, a_scale, type_a, b, b_scale, type_b, fast_math=fast_math, out_dtype=tl.float32)
-        out_ptr = out + tl.arange(0, BLOCK_M)[:, None] * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
-        tl.store(out_ptr, out_tensor.to(a.dtype))
+@pytest.mark.parametrize('srcDtype',
+                         ['float16', 'float32', 'bfloat16', 'uint8','uint16', 'uint32', 'uint64']
+                         )
+@pytest.mark.parametrize('dstDtype',
+                         ['float16', 'float32', 'bfloat16', 'uint8','uint16', 'uint32', 'uint64']
+                         )
+@pytest.mark.parametrize('shape', TestUtils.full_shape_4_8d)
+def test_cast_nd_float(srcDtype, dstDtype, shape):
+    srcBytes = get_dtype_size(srcDtype)
+    dstBytes = get_dtype_size(dstDtype)
+    dtype_size = max(srcBytes, dstBytes)
+    if 'int8' in {srcDtype, dstDtype} or 'uint8' in {srcDtype, dstDtype}:
+        key = f"{srcDtype} -> {dstDtype}"
+        max_size = dtype_max_size_1d[key]
+        numel = math.prod(shape)
+        if len(shape) == 1:  # 1-D
+            if numel > max_size:
+                pytest.skip(f"1-D shape {shape} numel={numel} > max_size={max_size}")
+        else:  # N-D
+            if (shape[-1] * dtype_size) % 32 == 0:  # 尾轴 32 B 对齐
+                limit = max_size // 8
+            else:
+                limit = max_size // 8 // 32
+            if numel > limit:
+                pytest.skip(f"ND shape {shape} numel={numel} > limit={limit}")
+    else:
+        if dtype_size * math.prod(shape) >= TestUtils.ub_size / 12:
+            pytest.skip(f"UB memory estimate overflow")
 
-    def make_scale_tensor(scale, data_dtype):
-        if data_dtype == torch.bfloat16:
-            scale_i16 = scale.to(torch.int16)
-            return (scale_i16 << 7).view(torch.bfloat16)
-        scale_fp32 = (scale.to(torch.int32) << 23).view(torch.float32)
-        return scale_fp32.to(torch.float16)
+    # x0 = test_common.generate_tensor(shape, srcDtype)
+    x0 = test_common.generate_tensor_new(shape, srcDtype, extreme_ratio=0, special_ratio=0, precision_ratio=0,  seed=1000).npu()
 
-    def golden_ref(x, scale_x, y, scale_y, fast_math):
-        upscale_x = make_scale_tensor(scale_x.repeat_interleave(x.shape[1] // scale_x.shape[1], dim=1), x.dtype)
-        scale_y_t = scale_y.T
-        upscale_y = make_scale_tensor(scale_y_t.repeat_interleave(y.shape[0] // scale_y_t.shape[0], dim=0), y.dtype)
-        scaled_x = x * upscale_x
-        scaled_y = y * upscale_y
+    torch_res = x0.cpu().to(eval("torch." + dstDtype))
+    print('input: ', x0.cpu())
+    triton_res = torch.empty(shape, dtype=eval("torch." + dstDtype)).npu()
 
-        if not fast_math:
-            lhs_nan_mask = scale_x.eq(255).repeat_interleave(x.shape[1] // scale_x.shape[1], dim=1)
-            rhs_nan_mask = scale_y_t.eq(255).repeat_interleave(y.shape[0] // scale_y_t.shape[0], dim=0)
-            scaled_x = torch.where(lhs_nan_mask, torch.full_like(scaled_x, float("nan")), scaled_x)
-            scaled_y = torch.where(rhs_nan_mask, torch.full_like(scaled_y, float("nan")), scaled_y)
+    triton_shape = [*shape]
+    while len(triton_shape) < 8:
+        triton_shape.append(1)
+    grid = (1,)
+    cast_to_nd[grid](triton_res, x0, *triton_shape)
+    print('Triton result: ', triton_res.cpu())
+    print('Torch result: ', torch_res.cpu())
+    diff_mask = triton_res.cpu() != torch_res.cpu()          # 逐元素布尔张量
 
-        return torch.matmul(scaled_x, scaled_y)
+    if diff_mask.any():                          # 只要有不同
+        idx = diff_mask.nonzero(as_tuple=False)  # N×ndim 的坐标矩阵
+        print(f'共有 {idx.size(0)} 处不同')
+    # 只打印前 10 条，防止刷屏
+        for i, pos in enumerate(idx[:10]):
+            pos = tuple(pos.tolist())            # 把 torch.Tensor 转 tuple
+            print(f'pos={pos}  |  '
+                  f'Triton={triton_res[pos].item()}  |  '
+                  f'Torch={torch_res[pos].item()}')
+    else:
+        print('完全相等')
+    test_common.validate_cmp(dstDtype, triton_res.cpu(), torch_res.cpu())
 
-    dtype = torch.float16 if normal_type == "fp16" else torch.bfloat16
-    x = torch.full((m, k), 2.0, dtype=dtype, device=device)
-    y = torch.full((k, n), 3.0, dtype=dtype, device=device)
-    scale_x = torch.zeros((m, k // 32), dtype=torch.uint8, device=device)
-    scale_y = torch.zeros((n, k // 32), dtype=torch.uint8, device=device)
-    scale_x[3, 0] = 255
-    scale_y[5, 0] = 255
 
-    def run_kernel(fast_math):
-        out = torch.empty((m, n), dtype=dtype, device=device)
-        dot_scale_kernel[(1, )](x, *x.stride(), scale_x, y, *y.stride(), scale_y, out, m, n, k, normal_type,
-                                normal_type, fast_math, num_warps=4)
-        return out
+@pytest.mark.parametrize('srcDtype',
+                         ['int8', 'int16', 'int32', 'int64', 'uint8', 'uint16', 'uint32', 'uint64']
+                         )
+@pytest.mark.parametrize('dstDtype',
+                         ['int8', 'int16', 'int32', 'int64', 'uint8', 'float16', 'float32', 'bfloat16']
+                         )
+@pytest.mark.parametrize('shape', TestUtils.full_shape_4_8d)
+def test_cast_nd_int(srcDtype, dstDtype, shape):
+    print('shape: ', shape)
+    srcBytes = get_dtype_size(srcDtype)
+    dstBytes = get_dtype_size(dstDtype)
+    dtype_size = max(srcBytes, dstBytes)
+    if 'int8' in {srcDtype, dstDtype} or 'uint8' in {srcDtype, dstDtype}:
+        key = f"{srcDtype} -> {dstDtype}"
+        max_size = dtype_max_size_1d[key]
+        numel = math.prod(shape)
+        if len(shape) == 1:  # 1-D
+            if numel > max_size:
+                pytest.skip(f"1-D shape {shape} numel={numel} > max_size={max_size}")
+        else:  # N-D
+            if (shape[-1] * dtype_size) % 32 == 0:  # 尾轴 32 B 对齐
+                limit = max_size // 8
+            else:
+                limit = max_size // 8 // 32
+            if numel > limit:
+                pytest.skip(f"ND shape {shape} numel={numel} > limit={limit}")
+    else:
+        if dtype_size * math.prod(shape) >= TestUtils.ub_size / 12:
+            pytest.skip(f"UB memory estimate overflow")
 
-    out_fast_math = run_kernel(True)
-    out_precise = run_kernel(False)
+    x0 = test_common.generate_tensor(shape, srcDtype, extreme_ratio=0, special_ratio=0, seed=1000)
+    torch_res = x0.cpu().to(eval("torch." + dstDtype))
+    x0 = x0.npu()
 
-    ref_fast_math = golden_ref(x, scale_x, y, scale_y, fast_math=True)
-    ref_precise = golden_ref(x, scale_x, y, scale_y, fast_math=False)
+    triton_res = torch.empty(shape, dtype=eval("torch." + dstDtype)).npu()
 
-    assert torch.isnan(out_precise[3, :]).all()
-    assert torch.isnan(out_precise[:, 5]).all()
-    assert not torch.isnan(out_precise[:3, :5]).any()
+    triton_shape = [*shape]
+    while len(triton_shape) < 8:
+        triton_shape.append(1)
+    grid = (1,)
+    cast_to_nd[grid](triton_res, x0, *triton_shape)
+    test_common.validate_cmp(dstDtype, triton_res, torch_res)
 
-    torch.testing.assert_close(out_fast_math, ref_fast_math, atol=1e-3, rtol=1e-2, equal_nan=True)
-    torch.testing.assert_close(out_precise, ref_precise, atol=1e-3, rtol=1e-2, equal_nan=True)
+
+# ===========================================
+@triton.jit
+def cast_to_nd_satu(
+        out_ptr, in_ptr,
+        D1: tl.constexpr, D2: tl.constexpr, D3: tl.constexpr, D4: tl.constexpr,
+        D5: tl.constexpr, D6: tl.constexpr, D7: tl.constexpr, D8: tl.constexpr,
+):
+    dtype = out_ptr.type.element_ty
+
+    off = tl.arange(0, D1) * (D2 * D3 * D4 * D5 * D6 * D7 * D8)
+    if (D2 * D3 * D4 * D5 * D6 * D7 * D8) > 1:
+        off = off[:, None, ] + tl.arange(0, D2)[None, :] * (D3 * D4 * D5 * D6 * D7 * D8)
+    if (D3 * D4 * D5 * D6 * D7 * D8) > 1:
+        off = off[:, :, None] + tl.arange(0, D3)[None, None, :] * (D4 * D5 * D6 * D7 * D8)
+    if (D4 * D5 * D6 * D7 * D8) > 1:
+        off = off[:, :, :, None] + tl.arange(0, D4)[None, None, None, :] * (D5 * D6 * D7 * D8)
+    if (D5 * D6 * D7 * D8) > 1:
+        off = off[:, :, :, :, None] + tl.arange(0, D5)[None, None, None, None, :] * (D6 * D7 * D8)
+    if (D6 * D7 * D8) > 1:
+        off = off[:, :, :, :, :, None] + tl.arange(0, D6)[None, None, None, None, None, :] * (D7 * D8)
+    if (D7 * D8) > 1:
+        off = off[:, :, :, :, :, :, None] + tl.arange(0, D7)[None, None, None, None, None, None, :] * D8
+    if D8 > 1:
+        off = off[:, :, :, :, :, :, :, None] + tl.arange(0, D8)[None, None, None, None, None, None, None, :]
+
+    mask = off < (D1 * D2 * D3 * D4 * D5 * D6 * D7 * D8)
+    x = tl.load(in_ptr + off)
+    y = extension.cast(x, dtype, overflow_mode='saturate')
+    tl.store(out_ptr + off, y)
+
+
+# TODO 涉及场景 包含参数
+# 修改kernel 入参
+@triton.jit
+def cast_to_nd_with_parameter(
+        out_ptr, in_ptr,
+        D1: tl.constexpr, D2: tl.constexpr, D3: tl.constexpr, D4: tl.constexpr,
+        D5: tl.constexpr, D6: tl.constexpr, D7: tl.constexpr, D8: tl.constexpr,
+        fp_downcast_rounding: tl.constexpr, bitcast: tl.constexpr):
+    dtype = out_ptr.type.element_ty
+
+    off = tl.arange(0, D1) * (D2 * D3 * D4 * D5 * D6 * D7 * D8)
+    if (D2 * D3 * D4 * D5 * D6 * D7 * D8) > 1:
+        off = off[:, None, ] + tl.arange(0, D2)[None, :] * (D3 * D4 * D5 * D6 * D7 * D8)
+    if (D3 * D4 * D5 * D6 * D7 * D8) > 1:
+        off = off[:, :, None] + tl.arange(0, D3)[None, None, :] * (D4 * D5 * D6 * D7 * D8)
+    if (D4 * D5 * D6 * D7 * D8) > 1:
+        off = off[:, :, :, None] + tl.arange(0, D4)[None, None, None, :] * (D5 * D6 * D7 * D8)
+    if (D5 * D6 * D7 * D8) > 1:
+        off = off[:, :, :, :, None] + tl.arange(0, D5)[None, None, None, None, :] * (D6 * D7 * D8)
+    if (D6 * D7 * D8) > 1:
+        off = off[:, :, :, :, :, None] + tl.arange(0, D6)[None, None, None, None, None, :] * (D7 * D8)
+    if (D7 * D8) > 1:
+        off = off[:, :, :, :, :, :, None] + tl.arange(0, D7)[None, None, None, None, None, None, :] * D8
+    if D8 > 1:
+        off = off[:, :, :, :, :, :, :, None] + tl.arange(0, D8)[None, None, None, None, None, None, None, :]
+
+    mask = off < (D1 * D2 * D3 * D4 * D5 * D6 * D7 * D8)
+    x = tl.load(in_ptr + off)
+    y = tl.cast(x, dtype, fp_downcast_rounding=fp_downcast_rounding, bitcast=bitcast)
+    tl.store(out_ptr + off, y)
+
+
+# 添加典型值
+shapes_list = [
+    (13,),
+    (9,),
+    (1,),
+    (23,),
+    (300,),
+    (600,),
+
+    (1, 23),
+    (1, 1),
+    (25, 5),
+    (11, 33),
+    (1000, 1),
+    (20, 27),
+
+    (3, 3, 3),
+    (1, 1, 23),
+    (1, 22, 39),
+    (27, 1, 39),
+    (27, 22, 1),
+    (1, 1, 23),
+    (23, 1, 1),
+    (1, 23, 1),
+    (37, 5, 3),
+    (2, 29, 4),
+    (7, 31, 7),
+    (3, 5, 8),
+    (7, 17, 15),
+    (25, 5, 16),
+    (13, 5, 31),
+    (9, 11, 32),
+    (7, 11, 33),
+    (1, 1, 1),
+    (1, 23, 1),
+    (7, 17, 41),
+    (1, 1000, 1),
+    (13, 27, 10),
+    (3, 27, 5),
+    (9, 31, 25),
+    (2, 25, 9),
+    (5, 25, 3),
+    (3, 15, 33),
+    (2, 9, 15),
+    (19, 7, 3),
+    (1, 1, 1, 23),
+    (1, 1, 1, 1),
+    (7, 5, 3, 4),
+    (4, 5, 32, 16),
+    (7, 17, 5, 4),
+    (1, 1000, 1, 1),
+    (1, 1, 1000, 1),
+    (1, 1, 1, 1, 23),
+    (1, 1, 1, 1, 1),
+    (2, 2, 2, 2, 2),
+    (2, 4, 5, 4, 3),
+    (1, 1, 1, 1000, 1),
+    (1, 1, 1, 1, 1, 1),
+    (2, 2, 2, 2, 2, 2),
+    (2, 4, 2, 3, 2, 8),
+
+    (1, 1, 1, 1, 1, 1, 1),
+    (2, 2, 2, 2, 2, 2, 2),
+    (2, 2, 3, 2, 2, 2, 5),
+
+    (1, 1, 1, 1, 1, 1, 1, 1),
+    (2, 2, 2, 1, 2, 2, 2, 1),
+]
+
+# ++++++++++++
+
+
+extreme_range_dict = {
+    'int8': [-128, 127],
+    'int16': [-32768, 32767],
+    'int32': [-2147483648, 2147483647],
+    'int64': [-9223372036854775808, 9223372036854775807],
+    'uint8': [0, 255],
+    'uint16': [0, 65535],
+    'uint32': [0, 4294967295],
+    'uint64': [0, 18446744073709551615],
+    'float16': [-65504, 65504],
+    'float32': [-3.4e+38, 3.4e+38],
+    'bfloat16': [-3.38953e+38, 3.38953e+38],
+    'bool': [-1, 1],  # 不生效，实际只在True和False中取值
+    'fp8e4m3': [-240, 240],
+    'fp8e5m2': [-57344, 57344],
+    'fp8e5b16': [-57344, 57344],
+    'fp4': [-6, 6],
+}
+
+# TODO fp_downcast_rounding参数
+transfer_list = [
+    ['float32', 'float16'],
+    ['float32', 'bfloat16'],
+    ['float32', 'float32'],
+    ['float16', 'float16'],
+    ['bfloat16', 'bfloat16'],
+    ['float32', 'fp8e4m3'],
+    ['float32', 'fp8e5m2'],
+    ['float16', 'fp8e4m3'],
+    ['float16', 'fp8e4m3'],
+    ['bfloat16', 'fp8e5m2'],
+    ['bfloat16', 'fp8e4m3'],
+    ['fp8e5m2', 'fp8e5m2'],
+    ['fp8e4m3', 'fp8e4m3'],
+]
+
+
+def cast_with_rounding(x: torch.Tensor, dtype_str: str, rounding: str):
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "fp8e5m2": torch.float8_e5m2,
+        "fp8e4m3": torch.float8_e4m3fn,
+    }
+    target_dtype = dtype_map[dtype_str]
+
+    # 如果目标类型和源类型相同，则不做任何操作
+    if x.dtype == target_dtype:
+        return x
+
+    # 升精度到 float32 再做降精计算
+    x = x.to(torch.float32)
+
+    if rounding == "rtne":
+        return x.to(target_dtype)
+
+    elif rounding == "rtz":
+        if target_dtype == torch.float16:
+            scale = 2 ** 10
+        elif target_dtype == torch.bfloat16:
+            scale = 2 ** 7
+        else:
+            return x
+
+        truncated = torch.where(x > 0, torch.floor(x * scale) / scale,
+                                torch.ceil(x * scale) / scale)
+        return truncated.to(target_dtype)
+
+
+@pytest.mark.parametrize('fp_downcast_rounding', ["rtne", "rtz"])
+@pytest.mark.parametrize('sigtype, dstDtype', transfer_list)
+@pytest.mark.parametrize('shape', shapes_list)
+def test_cast_fp_downcast_rounding(fp_downcast_rounding, dstDtype, sigtype, shape, bitcast=False):
+    if sigtype == 'fp8e4m3':
+        sigtype_new = 'float8_e4m3fn'
+        srcBytes = get_dtype_size(sigtype_new)
+    elif sigtype == 'fp8e5m2':
+        sigtype_new = 'float8_e5m2'
+        srcBytes = get_dtype_size(sigtype_new)
+    else:
+        srcBytes = get_dtype_size(sigtype)
+
+    if dstDtype == 'fp8e4m3':
+        dstDtype_new = 'float8_e4m3fn'
+        dstBytes = get_dtype_size(dstDtype_new)
+    elif dstDtype == 'fp8e5m2':
+        dstDtype_new = 'float8_e5m2'
+        dstBytes = get_dtype_size(dstDtype_new)
+    else:
+        dstBytes = get_dtype_size(dstDtype)
+
+    dtype_size = max(srcBytes, dstBytes)
+
+
+    if dstDtype == 'int8':
+        if dtype_size * math.prod(shape) >= (TestUtils.ub_size / 100):
+            pytest.skip(f"UB memory estimate overflow")
+            return
+    elif dtype_size * math.prod(shape) >= (TestUtils.ub_size / 12):
+        pytest.skip(f"UB memory estimate overflow")
+
+    x0 = test_common.generate_tensor(shape, sigtype)
+    if dstDtype == 'fp8e4m3':
+        dstDtype_new = 'float8_e4m3fn'
+        torch_res = cast_with_rounding(x0, sigtype, fp_downcast_rounding).to(eval("torch." + dstDtype_new))
+        triton_res = torch.empty(shape, dtype=eval("torch." + dstDtype_new)).npu()
+    elif dstDtype == 'fp8e5m2':
+        dstDtype_new = 'float8_e5m2'
+        torch_res = cast_with_rounding(x0, sigtype, fp_downcast_rounding).to(eval("torch." + dstDtype_new))
+        triton_res = torch.empty(shape, dtype=eval("torch." + dstDtype_new)).npu()
+    else:
+        torch_res = cast_with_rounding(x0, sigtype, fp_downcast_rounding).to(eval("torch." + dstDtype))
+        triton_res = torch.empty(shape, dtype=eval("torch." + dstDtype)).npu()
+
+    x0 = x0.npu()
+
+    # triton_res = torch.empty(shape, dtype=eval("torch." + dstDtype)).npu()
+
+    triton_shape = [*shape]
+    while len(triton_shape) < 8:
+        triton_shape.append(1)
+    grid = (1,)
+    cast_to_nd_with_parameter[grid](triton_res, x0, *triton_shape, fp_downcast_rounding, bitcast)
+    test_common.validate_cmp(dstDtype, triton_res, torch_res)
+
+
+# set bitcast=True
+def bitcast_reference(x, src_dtype, dst_dtype):
+    src_t = x.to(eval("torch." + dst_dtype))
+
+    src_bytes = torch.empty([], dtype=eval("torch." + src_dtype)).element_size()
+    dst_bytes = torch.empty([], dtype=eval("torch." + dst_dtype)).element_size()
+
+    if src_bytes != dst_bytes:
+        raise ValueError(
+            f"bitcast requires same element size, but got {src_bytes} vs {dst_bytes}"
+        )
+
+    return src_t.view(eval("torch." + dst_dtype))
+
+
+@pytest.mark.parametrize('srcDtype',
+                         ['int8', 'float16', 'float32', 'int16', 'int32', 'int64', 'bfloat16', 'int64', 'uint8',
+                          'uint16', 'uint32', 'uint64', 'fp8e5m2', 'fp8e4m3'])
+@pytest.mark.parametrize('dstDtype',
+                         ['int8', 'float16', 'float32', 'int16', 'int32', 'int64', 'bfloat16', 'int64', 'uint8',
+                          'uint16', 'uint32', 'uint64', 'fp8e5m2', 'fp8e4m3'])
+@pytest.mark.parametrize('shape', shapes_list)
+def test_cast_bitcast_on(srcDtype, dstDtype, shape, bitcast=True, fp_downcast_rounding="rtne"):
+    srcBytes = get_dtype_size(srcDtype)
+    dstBytes = get_dtype_size(dstDtype)
+
+    dtype_size = max(srcBytes, dstBytes)
+    if dstDtype == 'int8':
+        if dtype_size * math.prod(shape) >= (TestUtils.ub_size / 100):
+            pytest.skip(f"UB memory estimate overflow")
+            return
+    elif dtype_size * math.prod(shape) >= (TestUtils.ub_size / 12):
+        pytest.skip(f"UB memory estimate overflow")
+
+    if srcBytes != dstBytes:
+        pytest.skip(f"bitcast invalid: size mismatch {srcBytes} vs {dstBytes}")
+    elif srcBytes == 'fp8e5m2' and dstDtype == 'fp8e4m3':
+        pytest.skip(f"fp8e5m2 cannot bitcast to fp8e4m3")
+    elif srcBytes == 'fp8e4m3' and dstDtype == 'fp8e5m2':
+        pytest.skip(f"fp8e4m3 cannot bitcast to fp8e5m2")
+
+    x0 = test_common.generate_tensor(shape, srcDtype)
+    x0_npu = x0.npu()
+    dtype_new = test_common.get_torch_typename(dstDtype)
+    torch_res = x0.view(dtype_new)
+    triton_res = torch.empty(shape, dtype=dtype_new).npu()
+
+    triton_shape = [*shape] + [1] * (8 - len(shape))
+    cast_to_nd_with_parameter[(1,)](
+        triton_res, x0_npu, *triton_shape, fp_downcast_rounding, bitcast
+    )
+
+    assert triton_res.dtype == dtype_new
+
+    test_common.validate_cmp(dstDtype, triton_res, torch_res)
+
+
+# overflow_mode
+transfer_list = [
+    ('int64', 'int32'),
+    ('int64', 'uint32'),
+    ('uint64', 'uint32'),
+    ('uint64', 'int32'),
+    ('int64', 'int16'),
+    ('int64', 'uint16'),
+    ('uint64', 'int16'),
+    ('uint64', 'uint16'),
+    ('int64', 'int8'),
+    ('int64', 'uint8'),
+    ('uint64', 'int8'),
+    ('uint64', 'uint8'),
+    ('int32', 'int16'),
+    ('int32', 'int8'),
+    ('int32', 'uint8'),
+    ('int32', 'uint16'),
+    ('int32', 'uint8'),
+    ('uint32', 'int16'),
+    ('uint32', 'int8'),
+    ('uint32', 'uint16'),
+    ('uint32', 'uint8'),
+    ('int16', 'int8'),
+    ('int16', 'uint8'),
+    ('uint16', 'int8'),
+    ('uint16', 'uint8'),
+]
+
+
+# ('int64', 'uint32'),
+# ('int64', 'uint16'),
+# ('int32', 'uint16'),
+# ('uint64', 'uint32'),
+# ('uint64', 'uint16'),
+# ('uint32', 'uint16'),
+import numpy as np
+
+
+def saturate_cast_numpy(x, dst_dtype):
+    dtype_map = {
+        torch.uint8: np.uint8, torch.uint16: np.uint16,
+        torch.uint32: np.uint32, torch.uint64: np.uint64,
+        torch.int8: np.int8, torch.int16: np.int16,
+        torch.int32: np.int32, torch.int64: np.int64,
+    }
+
+    np_dtype = dtype_map[dst_dtype]
+    info = np.iinfo(np_dtype)
+
+    np_x = x.cpu().numpy()
+
+    # 关键修复：确保 min/max 是 numpy scalar 且类型正确
+    min_val = np.dtype(np_dtype).type(info.min)
+    max_val = np.dtype(np_dtype).type(info.max)
+
+    np_x = np.clip(np_x, min_val, max_val).astype(np_dtype)
+    return torch.from_numpy(np_x).to(x.device)
+
+
+@triton.jit
+def cast_to_nd_with_overflow(
+        out_ptr, in_ptr,
+        D1: tl.constexpr, D2: tl.constexpr, D3: tl.constexpr, D4: tl.constexpr,
+        D5: tl.constexpr, D6: tl.constexpr, D7: tl.constexpr, D8: tl.constexpr,
+        overflow_mode: tl.constexpr):
+    dtype = out_ptr.type.element_ty
+
+    off = tl.arange(0, D1) * (D2 * D3 * D4 * D5 * D6 * D7 * D8)
+    if (D2 * D3 * D4 * D5 * D6 * D7 * D8) > 1:
+        off = off[:, None, ] + tl.arange(0, D2)[None, :] * (D3 * D4 * D5 * D6 * D7 * D8)
+    if (D3 * D4 * D5 * D6 * D7 * D8) > 1:
+        off = off[:, :, None] + tl.arange(0, D3)[None, None, :] * (D4 * D5 * D6 * D7 * D8)
+    if (D4 * D5 * D6 * D7 * D8) > 1:
+        off = off[:, :, :, None] + tl.arange(0, D4)[None, None, None, :] * (D5 * D6 * D7 * D8)
+    if (D5 * D6 * D7 * D8) > 1:
+        off = off[:, :, :, :, None] + tl.arange(0, D5)[None, None, None, None, :] * (D6 * D7 * D8)
+    if (D6 * D7 * D8) > 1:
+        off = off[:, :, :, :, :, None] + tl.arange(0, D6)[None, None, None, None, None, :] * (D7 * D8)
+    if (D7 * D8) > 1:
+        off = off[:, :, :, :, :, :, None] + tl.arange(0, D7)[None, None, None, None, None, None, :] * D8
+    if D8 > 1:
+        off = off[:, :, :, :, :, :, :, None] + tl.arange(0, D8)[None, None, None, None, None, None, None, :]
+
+    x = tl.load(in_ptr + off)
+    y = extension.cast(x, dtype, overflow_mode=overflow_mode)
+    tl.store(out_ptr + off, y)
+
+
+if __name__ == "__main__":
+    for shape in [(3,), (3, 3), (3, 3, 3)]:
+        for srcDtype in ['int8', 'float32', 'bool']:
+            for dstDtype in ['int8', 'float32', 'bool']:
+                test_cast(srcDtype, dstDtype, shape)
